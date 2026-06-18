@@ -128,7 +128,7 @@
 <script>
 (function(){
   "use strict";
-  var active=false, processing=false, speaking=false, listening=false, direction="ko2th";
+  var active=false, processing=false, speaking=false, listening=false, paused=false, direction="ko2th";
   var recognition=null, flushTimer=null, lastResultAt=0, buffer="", muteUntil=0;
   var wakeLock=null;
   var micStream=null;   // 앱 종료 전까지 마이크 권한을 계속 붙잡아 두는 스트림
@@ -200,20 +200,36 @@
   setTimeout(updateVoiceStatus,300);
 
   function primeTTS(){ if(!window.speechSynthesis) return; try{ window.speechSynthesis.resume(); var u=new SpeechSynthesisUtterance("\u00A0"); u.volume=0; u.rate=1; window.speechSynthesis.speak(u); }catch(e){} }
-  function speak(text,lang){
+  function ttsChunks(text){
+    var raw=(text||"").split(/(?<=[.!?。！？\u0E2F\n])\s*/);
+    var out=[];
+    raw.forEach(function(seg){
+      seg=(seg||"").trim(); if(!seg) return;
+      while(seg.length>160){ var cut=seg.lastIndexOf(" ",160); if(cut<60) cut=160; out.push(seg.slice(0,cut).trim()); seg=seg.slice(cut).trim(); }
+      if(seg) out.push(seg);
+    });
+    return out.length?out:[(text||"").trim()];
+  }
+  function speakOne(text,lang){
     return new Promise(function(resolve){
       var ss=window.speechSynthesis; if(!ss||!text){ resolve(); return; }
       var u=new SpeechSynthesisUtterance(text); u.lang=lang;
-      var v=pickVoice(lang); if(v) u.voice=v; u.volume=1; u.rate=parseFloat($rate.value)||1.05;
-      var started=false, done=false, keep=null;
-      function clean(){ if(keep){ clearInterval(keep); keep=null; } }
-      function finish(){ if(done) return; done=true; speaking=false; clean(); resolve(); }
-      u.onstart=function(){ started=true; setStatus("통역 음성 출력 중…","ok"); };
-      u.onend=finish; u.onerror=function(){ finish(); };
-      speaking=true; try{ ss.resume(); }catch(e){} ss.speak(u);
-      keep=setInterval(function(){ try{ ss.resume(); }catch(e){} },7000);
-      var guardMs=Math.min(30000,2500+text.length*95);
-      setTimeout(function(){ if(done) return; if(!started) setStatus("음성이 나오지 않았습니다. 볼륨/‘음성 테스트’ 확인.","err"); finish(); },guardMs);
+      var v=pickVoice(lang); if(v) u.voice=v; u.volume=1; u.pitch=1; u.rate=parseFloat($rate.value)||1.05;
+      var done=false; function finish(){ if(done) return; done=true; resolve(); }
+      u.onend=finish; u.onerror=finish;
+      try{ ss.resume(); }catch(e){}
+      try{ ss.speak(u); }catch(e){ finish(); return; }
+      setTimeout(finish, Math.min(20000, 1600 + text.length*110)); // 보호 타임아웃(짧은 청크)
+    });
+  }
+  function speak(text,lang){
+    speaking=true; setStatus("통역 음성 출력 중…","ok");
+    var chunks=ttsChunks(text), i=0;
+    return new Promise(function(resolve){
+      (function next(){
+        if(i>=chunks.length){ speaking=false; resolve(); return; }
+        speakOne(chunks[i++],lang).then(function(){ setTimeout(next,60); }); // 청크 사이 짧은 간격
+      })();
     });
   }
 
@@ -306,22 +322,24 @@
     };
     rec.onend=function(){
       listening=false;
-      if(active) setTimeout(function(){ if(active&&!listening) startRecognition(); },300);
+      if(active&&!paused) setTimeout(function(){ if(active&&!paused&&!listening) startRecognition(); },300);
     };
     recognition=rec; return rec;
   }
   function startRecognition(){
-    if(listening) return;
+    if(listening||paused) return;
     var rec=ensureRecognition(); if(!rec){ setStatus("이 브라우저는 음성 인식을 지원하지 않습니다. Chrome을 사용하세요.","err"); return; }
     var L=langs(); rec.lang=L.rec; lastResultAt=Date.now();
     try{ rec.start(); }catch(e){ /* 이미 시작됨 */ }
     scheduleFlush();
   }
+  function pauseListening(){ paused=true; clearTimeout(flushTimer); listening=false; if(recognition){ try{ recognition.abort(); }catch(e){} } }
+  function resumeListening(){ if(!active) return; paused=false; muteUntil=Date.now()+250; buffer=""; lastResultAt=Date.now(); startRecognition(); }
   function scheduleFlush(){
     clearTimeout(flushTimer);
     flushTimer=setTimeout(function tick(){
       if(!active) return;
-      if(!processing&&!speaking&&Date.now()>=muteUntil){
+      if(!processing&&!speaking&&!paused&&Date.now()>=muteUntil){
         var text=buffer.trim();
         if(text && (Date.now()-lastResultAt)>=SILENCE_MS){ buffer=""; handleTranscript(text); }
       }
@@ -331,16 +349,17 @@
 
   /* ---------- 한 문장 처리 (인식은 끄지 않고 계속 유지) ---------- */
   function handleTranscript(text){
-    processing=true; var L=langs(); showLive(text); setStatus("통역 중…","ok");
+    processing=true; pauseListening();   // 통역 음성 동안 마이크 인식을 꺼서 끊김/충돌 방지
+    var L=langs(); showLive(text); setStatus("통역 중…","ok");
     translate(text).then(function(tr){
       commitTurn(text,tr);
       return new Promise(function(r){ setTimeout(r,20); }).then(function(){ return speak(tr,L.tts); });
     }).then(function(){
-      muteUntil=Date.now()+350; buffer=""; lastResultAt=Date.now(); processing=false;
-      if(active) setStatus("듣는 중… ("+L.src+")");
+      processing=false;
+      if(active){ setStatus("듣는 중… ("+L.src+")"); resumeListening(); }
     }).catch(function(err){
-      failTurn(text,err.message); setStatus("통역 실패: "+err.message,"err");
-      muteUntil=Date.now()+200; buffer=""; lastResultAt=Date.now(); processing=false;
+      failTurn(text,err.message); setStatus("통역 실패: "+err.message,"err"); processing=false;
+      if(active) resumeListening();
     });
   }
 
@@ -364,7 +383,7 @@
     var L=langs(); buffer=""; muteUntil=0; setStatus("통역 시작 — 듣는 중… ("+L.src+")","ok"); startRecognition();
   }
   function stopSession(){
-    active=false; processing=false; speaking=false; listening=false; clearTimeout(flushTimer); buffer="";
+    active=false; processing=false; speaking=false; listening=false; paused=false; clearTimeout(flushTimer); buffer="";
     if(recognition){ try{ recognition.onend=null; recognition.abort(); }catch(e){} recognition=null; }
     if(micStream){ try{ micStream.getTracks().forEach(function(t){ t.stop(); }); }catch(e){} micStream=null; }
     try{ window.speechSynthesis.cancel(); }catch(e){}
